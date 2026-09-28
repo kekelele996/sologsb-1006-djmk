@@ -3,11 +3,11 @@
   import Button from 'flowbite-svelte/Button.svelte'
   import {
     acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    confirmDraft, deleteCue, deleteDraft, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk,
+    sendReminder, setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget,
+    undoDesk, updateCue, updateDraft, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import type { Announcement, Cue, OfflineDraft, Session, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -33,9 +33,11 @@
   $: currentSession = $desk.sessions.find(item => item.status === 'live') || $desk.sessions[0]
   $: activeCue = $desk.cues.find(item => item.id === $desk.activeCueId) || $desk.cues.at(-1)
   $: pendingCount = $desk.cues.filter(item => item.status === 'pending').length
-  $: offlineCount = $desk.cues.filter(item => item.offline).length
+  $: waitingCount = $desk.drafts.filter(item => item.status === 'waiting').length
+  $: suspectCount = $desk.drafts.filter(item => item.status === 'suspect').length
+  $: offlineCount = $desk.drafts.length
   $: lateCount = $desk.cues.filter(item => getDelay(item, now) > 8 && item.status !== 'confirmed').length
-  $: duplicateCount = $desk.cues.filter(item => item.duplicateOf).length
+  $: duplicateCount = $desk.cues.filter(item => item.duplicateOf).length + suspectCount
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
@@ -88,12 +90,26 @@
     if (!manualText.trim()) return
     ingestCue(manualText, { manual: true, speakerId: manualSpeakerId || activeCue?.speakerId })
     manualText = ''
-    if (!$desk.online) flash('网络中断中，内容已暂存在本机。')
+    if (!$desk.online) flash('网络中断中，内容已进入本机待合并区排队。')
     else flash('手工录入已进入现场队列。')
   }
   function mergeOffline() {
     setOnline(true)
-    flash('网络已恢复，离线内容已合并并完成重复检查。')
+    flash(waitingCount ? `网络已恢复，${waitingCount} 条补录按顺序并入现场队列；疑似重复的留在待合并区。` : '网络已恢复，疑似重复的补录请在待合并区确认。')
+  }
+  function draftSuspect(cueId: string): OfflineDraft[] | undefined {
+    const found = $desk.drafts.filter(item => item.status === 'suspect' && item.duplicateOf === cueId)
+    return found.length ? found : undefined
+  }
+  function cuePosition(cueId: string | null): number {
+    return $desk.cues.findIndex(item => item.id === cueId) + 1
+  }
+  function suspectFor(draft: OfflineDraft): Cue | undefined {
+    return $desk.cues.find(item => item.id === draft.duplicateOf)
+  }
+  function resolveDraft(draft: OfflineDraft) {
+    confirmDraft(draft.id)
+    flash('已确认非重复，补录进入现场队列并从待合并区移除。')
   }
   function sendTermReminder(termId: string) {
     if (!activeCue) return
@@ -224,10 +240,16 @@
                         <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{speakerName($desk, cue.speakerId)}</span>
                         <span class="rounded-md border px-2 py-1 {delayClass(getDelay(cue, now))}">{formatTime(cue.receivedAt)} · 延迟 {getDelay(cue, now)}s</span>
                         <span class="rounded-md px-2 py-1 {cue.status === 'confirmed' ? 'bg-emerald-100 text-emerald-800' : cue.status === 'followup' ? 'bg-amber-100 text-amber-900' : 'bg-blue-100 text-blue-800'}">{statusLabel(cue.status)}</span>
-                        {#if cue.offline}<span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">离线暂存</span>{/if}
                         {#if cue.manual}<span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">手工</span>{/if}
+                        {#if draftSuspect(cue.id)}<span class="rounded-md bg-red-100 px-2 py-1 font-bold text-red-800">待合并区疑似相同</span>{/if}
                       </div>
                       <p class="text-sm leading-6 lg:text-base">{cue.text}</p>
+                      {#if draftSuspect(cue.id)}
+                        <div class="mt-2 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+                          <span><strong>疑似相同：</strong>待合并区有 {draftSuspect(cue.id)!.length} 条离线补录与本条高度相似，确认前不会进入队列</span>
+                          <button class="font-black underline" on:click|stopPropagation={() => tab = 'offline'}>前往处理</button>
+                        </div>
+                      {/if}
                       {#if cue.duplicateOf}
                         <div class="mt-2 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
                           <span><strong>疑似重复：</strong>与第 {$desk.cues.findIndex(item => item.id === cue.duplicateOf) + 1} 条高度相似</span>
@@ -355,20 +377,37 @@
           <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="font-black">手工录入现场文字</h2><p class="text-xs text-slate-500">按 Ctrl + Enter 也可以提交。</p></div><span class="rounded-full px-3 py-1 text-xs font-bold {$desk.online ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-900'}">{$desk.online ? '在线写入队列' : '离线保存本机'}</span></div>
           <label class="text-xs font-bold">发言人或场次<select class="focus-ring mt-2 w-full rounded-xl border p-3" bind:value={manualSpeakerId}><option value="">跟随当前发言人</option>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select></label>
           <label class="mt-4 block text-xs font-bold">现场文字<textarea bind:this={manualInput} class="focus-ring mt-2 w-full rounded-xl border p-4 text-base leading-7" rows="8" bind:value={manualText} placeholder="网络中断时，在这里继续录入…" on:keydown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitManual() }}></textarea></label>
-          <Button class="mt-3 w-full" size="lg" disabled={!manualText.trim()} on:click={submitManual}>加入队列</Button>
-          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>离线条目会带“本地”标记；恢复连接后自动与本机队列合并，并执行相似内容检测。</div>
+          <Button class="mt-3 w-full" size="lg" disabled={!manualText.trim()} on:click={submitManual}>{$desk.online ? '加入现场队列' : '存入待合并区'}</Button>
+          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>离线录入只进入本机待合并区并按录入先后排队，不会混入现场队列；恢复连接后依次并入，与已有内容高度相似的先留下，确认非重复或修改内容后才进入队列。</div>
         </section>
         <section class="rounded-2xl border bg-white p-5 shadow-sm">
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">合并与冲突检查</h2><p class="text-xs text-slate-500">当前有 {offlineCount} 条离线条目，{duplicateCount} 条疑似重复。</p></div><Button disabled={$desk.online || !offlineCount} color="green" on:click={mergeOffline}>恢复连接并合并</Button></div>
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">待合并区 · 按录入先后排队</h2><p class="text-xs text-slate-500">共 {offlineCount} 条待合并，其中 {waitingCount} 条等待并入、{suspectCount} 条疑似相同。</p></div><Button disabled={$desk.online || !offlineCount} color="green" on:click={mergeOffline}>恢复连接并合并</Button></div>
           <div class="space-y-3">
-            {#each $desk.cues.filter(item => item.offline) as cue}
-              <article class="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-4">
-                <div class="flex items-center justify-between text-[10px] font-bold text-amber-800"><span>本机暂存 · {formatTime(cue.receivedAt)}</span><span>{speakerName($desk, cue.speakerId)}</span></div>
-                <textarea class="focus-ring mt-3 w-full rounded-xl border border-amber-200 bg-white p-3 text-sm" rows="3" value={cue.text} on:change={event => updateCue(cue.id, { text: (event.target as HTMLTextAreaElement).value })}></textarea>
-                <div class="mt-2 flex justify-between"><span class="text-[10px] text-amber-800">等待恢复网络后进入现场队列</span><button class="text-xs font-bold text-red-700 underline" on:click={() => deleteCue(cue.id)}>删除暂存</button></div>
+            {#each $desk.drafts as draft, index}
+              <article class="rounded-xl border p-4 {draft.status === 'suspect' ? 'border-red-300 bg-red-50/60' : 'border-dashed border-amber-300 bg-amber-50/60'}">
+                <div class="flex items-center justify-between text-[10px] font-bold {draft.status === 'suspect' ? 'text-red-800' : 'text-amber-800'}">
+                  <span>#{index + 1} · {draft.status === 'suspect' ? '疑似相同 · 等待确认' : $desk.online ? '等待并入' : '本机暂存'} · {formatTime(draft.enteredAt)}</span>
+                  <span>{speakerName($desk, draft.speakerId)}</span>
+                </div>
+                <textarea class="focus-ring mt-3 w-full rounded-xl border bg-white p-3 text-sm {draft.status === 'suspect' ? 'border-red-200' : 'border-amber-200'}" rows="3" value={draft.text} on:change={event => updateDraft(draft.id, { text: (event.target as HTMLTextAreaElement).value })}></textarea>
+                {#if draft.status === 'suspect' && suspectFor(draft)}
+                  {@const original = suspectFor(draft)}
+                  <div class="mt-2 rounded-lg border border-red-200 bg-white px-3 py-2 text-xs text-red-800">
+                    <p><strong>与现场队列第 {cuePosition(original!.id)} 条疑似相同：</strong></p>
+                    <p class="mt-1 text-slate-700">“{original!.text}”</p>
+                    <p class="mt-1 text-[11px] text-slate-500">确认不是重复（或在上方修改内容）后才进入现场队列。</p>
+                  </div>
+                {/if}
+                <div class="mt-2 flex items-center justify-between">
+                  <span class="text-[10px] {draft.status === 'suspect' ? 'text-red-800' : 'text-amber-800'}">{draft.status === 'suspect' ? '阻塞中：后面的补录需等本条先处理' : '恢复网络后按顺序并入现场队列'}</span>
+                  <div class="flex gap-3">
+                    {#if draft.status === 'suspect'}<button class="text-xs font-bold text-emerald-700 underline" on:click={() => resolveDraft(draft)}>确认非重复并入</button>{/if}
+                    <button class="text-xs font-bold text-red-700 underline" on:click={() => deleteDraft(draft.id)}>删除</button>
+                  </div>
+                </div>
               </article>
             {/each}
-            {#if !offlineCount}<div class="grid min-h-60 place-items-center rounded-xl bg-slate-50 text-center"><div><div class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-emerald-100 text-2xl text-emerald-700">✓</div><strong class="mt-3 block text-sm">没有离线暂存条目</strong><p class="mt-1 text-xs text-slate-500">可断开网络后测试手工录入与恢复合并。</p></div></div>{/if}
+            {#if !offlineCount}<div class="grid min-h-60 place-items-center rounded-xl bg-slate-50 text-center"><div><div class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-emerald-100 text-2xl text-emerald-700">✓</div><strong class="mt-3 block text-sm">待合并区为空</strong><p class="mt-1 text-xs text-slate-500">断网时录入的内容会按顺序排在这里，恢复后逐条审查并入。</p></div></div>{/if}
           </div>
         </section>
       </div>

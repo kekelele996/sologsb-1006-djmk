@@ -43,11 +43,21 @@ export interface Cue {
   receivedAt: number
   status: CueStatus
   manual: boolean
-  offline: boolean
   delaySeconds: number
   duplicateOf: string | null
   followupText: string
   tags: string[]
+}
+
+/** 离线期间本机录入的草稿，单独放在待合并区，恢复网络后按顺序审查并入 */
+export interface OfflineDraft {
+  id: string
+  speakerId: string
+  text: string
+  enteredAt: number
+  status: 'waiting' | 'suspect'
+  /** 疑似重复时指向现场队列中的原条目 id */
+  duplicateOf: string | null
 }
 
 export interface Reminder {
@@ -65,6 +75,7 @@ export interface DeskState {
   terms: Term[]
   announcements: Announcement[]
   cues: Cue[]
+  drafts: OfflineDraft[]
   reminders: Reminder[]
   activeCueId: string
   fontScale: number
