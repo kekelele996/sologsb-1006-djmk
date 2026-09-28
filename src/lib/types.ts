@@ -46,8 +46,21 @@ export interface Cue {
   offline: boolean
   delaySeconds: number
   duplicateOf: string | null
+  /** 被待合并区的离线草稿疑似重复时，记录那条草稿的 id */
+  suspectDraftId: string | null
   followupText: string
   tags: string[]
+}
+
+/** 断网期间本机录入的草稿，独立于现场队列，恢复网络后按录入先后合并 */
+export interface OfflineDraft {
+  id: string
+  speakerId: string
+  text: string
+  enteredAt: number
+  /** 合并时被判定疑似重复：暂留待确认，不进入队列 */
+  held: boolean
+  duplicateOf: string | null
 }
 
 export interface Reminder {
@@ -65,6 +78,7 @@ export interface DeskState {
   terms: Term[]
   announcements: Announcement[]
   cues: Cue[]
+  offlineDrafts: OfflineDraft[]
   reminders: Reminder[]
   activeCueId: string
   fontScale: number

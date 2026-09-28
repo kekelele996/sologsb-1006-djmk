@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, OfflineDraft, Reminder, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -24,15 +24,15 @@ const terms: Term[] = [
 function initialCues(): Cue[] {
   const now = Date.now()
   return [
-    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'] },
-    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
-    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'] },
-    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'] }
+    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, suspectDraftId: null, followupText: '', tags: ['城市热岛'] },
+    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, suspectDraftId: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
+    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, suspectDraftId: null, followupText: '', tags: ['韧性', '协同效益'] },
+    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, suspectDraftId: null, followupText: '', tags: ['健康公平'] }
   ]
 }
 function demoState(): DeskState {
   return {
-    speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
+    speakers, sessions, terms, cues: initialCues(), offlineDrafts: [], reminders: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
@@ -41,11 +41,28 @@ function demoState(): DeskState {
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+function normalize(raw: DeskState): DeskState {
+  raw.offlineDrafts ??= []
+  raw.cues.forEach(cue => {
+    cue.suspectDraftId ??= null
+    cue.duplicateOf ??= null
+  })
+  // 旧版本里离线录入曾直接混入队列：这些条目收回待合并区，按时间顺序排队
+  const stranded = raw.cues.filter(cue => cue.offline).sort((a, b) => a.receivedAt - b.receivedAt)
+  if (stranded.length) {
+    raw.cues = raw.cues.filter(cue => !cue.offline)
+    stranded.forEach(cue => raw.offlineDrafts.push({
+      id: `draft-${cue.id}`, speakerId: cue.speakerId, text: cue.text, enteredAt: cue.receivedAt, held: false, duplicateOf: null
+    }))
+  }
+  return raw
+}
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    if (!saved) return demoState()
+    return normalize({ ...demoState(), ...JSON.parse(saved), online: navigator.onLine })
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -97,18 +114,64 @@ export function addAnnouncement(text: string, level: Announcement['level']) {
 }
 export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
 
+/** 按录入先后把待合并草稿并入现场队列；与已有内容高度相似的先留下等待确认 */
+function mergeOfflineDrafts(state: DeskState): { merged: number; held: number } {
+  let merged = 0
+  let held = 0
+  // 数组顺序即录入先后；held 草稿跳过，后面的草稿照常并入
+  for (const draft of state.offlineDrafts) {
+    if (draft.held) { held++; continue }
+    const duplicate = findDuplicate(draft.text, state.cues)
+    if (duplicate) {
+      draft.held = true
+      draft.duplicateOf = duplicate.id
+      duplicate.suspectDraftId = draft.id
+      held++
+      continue
+    }
+    state.cues.push(draftToCue(state, draft))
+    merged++
+  }
+  // 已并入的草稿从待合并区移除，重复点击恢复合并也不会再多出记录
+  state.offlineDrafts = state.offlineDrafts.filter(draft => draft.held)
+  if (merged) state.activeCueId = state.cues.at(-1)?.id || state.activeCueId
+  return { merged, held }
+}
+function draftToCue(state: DeskState, draft: OfflineDraft): Cue {
+  const receivedAt = draft.enteredAt
+  return {
+    id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    speakerId: draft.speakerId || resolveSpeakerId(state),
+    text: draft.text,
+    receivedAt,
+    status: 'pending',
+    manual: true,
+    offline: true,
+    delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
+    duplicateOf: null,
+    suspectDraftId: null,
+    followupText: '',
+    tags: detectTerms(draft.text, state.terms)
+  }
+}
+/** 解除草稿的疑似重复扣留，并清掉原条目上的标记 */
+function unholdDraft(state: DeskState, draft: OfflineDraft) {
+  if (draft.duplicateOf) {
+    const original = state.cues.find(cue => cue.id === draft.duplicateOf)
+    if (original && original.suspectDraftId === draft.id) original.suspectDraftId = null
+  }
+  draft.held = false
+  draft.duplicateOf = null
+}
+function resolveSpeakerId(state: DeskState, speakerId?: string): string {
+  return speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
+}
+
 export function setOnline(online: boolean) {
   commit(state => {
     state.online = online
-    if (online) {
-      state.cues.forEach(cue => {
-        if (cue.offline) {
-          cue.offline = false
-          const duplicate = findDuplicate(cue.text, state.cues.filter(item => item.id !== cue.id && !item.offline))
-          cue.duplicateOf = duplicate?.id || null
-        }
-      })
-    }
+    // 在线且仍有未扣留的草稿时即合并；没有草稿时是空操作，可重复调用
+    if (online && state.offlineDrafts.some(draft => !draft.held)) mergeOfflineDrafts(state)
   })
 }
 export function setLiveSimulation(enabled: boolean) { commit(state => { state.liveSimulation = enabled }) }
@@ -125,21 +188,88 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
   const trimmed = text.trim()
   if (!trimmed) return
   commit(state => {
+    // 断网时录入只进独立待合并区，按录入先后排队，绝不混入现场队列
+    if (!state.online) {
+      state.offlineDrafts.push({
+        id: `draft-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        speakerId: resolveSpeakerId(state, options.speakerId),
+        text: trimmed,
+        enteredAt: options.receivedAt || Date.now(),
+        held: false,
+        duplicateOf: null
+      })
+      return
+    }
     const existing = state.cues.filter(item => item.text !== trimmed)
     const duplicate = findDuplicate(trimmed, existing)
-    const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
+    const speakerId = resolveSpeakerId(state, options.speakerId)
     const receivedAt = options.receivedAt || Date.now()
     const cue: Cue = {
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
-      status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
-      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
+      status: 'pending', manual: Boolean(options.manual), offline: false, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
+      duplicateOf: duplicate?.id || null, suspectDraftId: null, followupText: '', tags: detectTerms(trimmed, state.terms)
     }
     state.cues.push(cue); state.activeCueId = cue.id
   })
 }
+
+/** 修改待合并草稿：改过内容后在线则重新比对，不再高度相似时立即并入队列 */
+export function updateOfflineDraft(id: string, patch: Partial<OfflineDraft>) {
+  commit(state => {
+    const draft = state.offlineDrafts.find(item => item.id === id)
+    if (!draft) return
+    Object.assign(draft, patch)
+    if (state.online) {
+      const duplicate = findDuplicate(draft.text, state.cues)
+      if (!duplicate) {
+        if (draft.held) unholdDraft(state, draft)
+        state.cues.push(draftToCue(state, draft))
+        state.activeCueId = state.cues.at(-1)?.id || state.activeCueId
+        state.offlineDrafts = state.offlineDrafts.filter(item => item.id !== id)
+      } else {
+        draft.held = true
+        draft.duplicateOf = duplicate.id
+        if (duplicate.suspectDraftId !== id) duplicate.suspectDraftId = id
+      }
+    }
+  })
+}
+export function deleteOfflineDraft(id: string) {
+  commit(state => {
+    const draft = state.offlineDrafts.find(item => item.id === id)
+    if (draft?.held) unholdDraft(state, draft)
+    state.offlineDrafts = state.offlineDrafts.filter(item => item.id !== id)
+  })
+}
+/** 人工确认某条暂留草稿不是重复（或已改过内容）：确认后才进入现场队列，并从待合并区移除 */
+export function acceptOfflineDraft(id: string) {
+  commit(state => {
+    const draft = state.offlineDrafts.find(item => item.id === id)
+    if (!draft) return
+    if (draft.held) unholdDraft(state, draft)
+    state.cues.push(draftToCue(state, draft))
+    state.activeCueId = state.cues.at(-1)?.id || state.activeCueId
+    state.offlineDrafts = state.offlineDrafts.filter(item => item.id !== id)
+  })
+}
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }
 export function setCueStatus(id: string, status: CueStatus) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.status = status }) }
-export function deleteCue(id: string) { commit(state => { state.cues = state.cues.filter(item => item.id !== id); if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || '' }) }
+export function deleteCue(id: string) {
+  commit(state => {
+    state.cues = state.cues.filter(item => item.id !== id)
+    // 原条目被删后，对应暂留草稿不再构成重复：在线则立即并入，离线则回到待合并队列
+    state.offlineDrafts.forEach(draft => {
+      if (draft.held && draft.duplicateOf === id) {
+        unholdDraft(state, draft)
+        if (state.online) state.cues.push(draftToCue(state, draft))
+      }
+    })
+    state.offlineDrafts = state.online
+      ? state.offlineDrafts.filter(draft => draft.held)
+      : state.offlineDrafts
+    if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || ''
+  })
+}
 export function clearDuplicate(id: string) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.duplicateOf = null }) }
 export function sendReminder(termId: string, cueId: string) {
   commit(state => {
